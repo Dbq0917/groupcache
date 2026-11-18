@@ -51,6 +51,17 @@ func (v ByteView) ByteSlice() []byte {
 	return []byte(v.s)
 }
 
+// bytesForMarshal returns the view's backing bytes without a copy.
+// It is only used to marshal a response on the serving peer, where
+// the bytes are read once and never mutated; callers must not modify
+// the returned slice.
+func (v ByteView) bytesForMarshal() []byte {
+	if v.b != nil {
+		return v.b
+	}
+	return []byte(v.s)
+}
+
 // String returns the data as a string, making a copy if necessary.
 func (v ByteView) String() string {
 	if v.b != nil {

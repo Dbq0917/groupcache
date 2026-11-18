@@ -59,6 +59,30 @@ In a nutshell, a groupcache lookup of **Get("foo")** looks like:
     the answer.  If the RPC fails, just load it locally (still with
     local dup suppression).
 
+## Framed retrieval of large values
+
+Values larger than a single transport message are no longer rejected.
+When a peer fetch needs more than one frame, the client requests
+consecutive byte ranges (`offset`/`limit` on `GetRequest`); the owner
+replies with the frame bytes and the authoritative total object
+`size` on `GetResponse`.
+
+* Each frame is capped at `maxFrameBytes` (default 64 KiB), so the
+  fixed-size message channel never sees an oversized write. The cap
+  is a tunable package variable for transports with a different limit.
+* A failed frame is retried independently (up to `frameRetryCount`
+  times). Retries re-request only the failed range instead of
+  restarting the whole object.
+* The client allocates the result once, sized to the total returned
+  by the first frame, and copies each frame into it as it arrives.
+  Beyond that single buffer, at most one frame is resident at a time.
+* The serving peer slices its cached `ByteView` to the requested
+  range and never clones or marshals the whole object per request.
+* Peers that do not understand range parameters still work: the
+  client detects a size-less response and accepts the whole object,
+  so upgrades can roll through a mixed-version cluster.
+
+
 ## Users
 
 groupcache is in production use by dl.google.com (its original user),

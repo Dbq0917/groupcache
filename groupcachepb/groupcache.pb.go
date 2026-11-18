@@ -16,6 +16,8 @@ var _ = math.Inf
 type GetRequest struct {
 	Group            *string `protobuf:"bytes,1,req,name=group" json:"group,omitempty"`
 	Key              *string `protobuf:"bytes,2,req,name=key" json:"key,omitempty"`
+	Offset           *int64  `protobuf:"varint,3,opt,name=offset" json:"offset,omitempty"`
+	Limit            *int64  `protobuf:"varint,4,opt,name=limit" json:"limit,omitempty"`
 	XXX_unrecognized []byte  `json:"-"`
 }
 
@@ -37,9 +39,24 @@ func (m *GetRequest) GetKey() string {
 	return ""
 }
 
+func (m *GetRequest) GetOffset() int64 {
+	if m != nil && m.Offset != nil {
+		return *m.Offset
+	}
+	return 0
+}
+
+func (m *GetRequest) GetLimit() int64 {
+	if m != nil && m.Limit != nil {
+		return *m.Limit
+	}
+	return 0
+}
+
 type GetResponse struct {
 	Value            []byte   `protobuf:"bytes,1,opt,name=value" json:"value,omitempty"`
 	MinuteQps        *float64 `protobuf:"fixed64,2,opt,name=minute_qps" json:"minute_qps,omitempty"`
+	Size             *int64   `protobuf:"varint,3,opt,name=size" json:"size,omitempty"`
 	XXX_unrecognized []byte   `json:"-"`
 }
 
@@ -57,6 +74,13 @@ func (m *GetResponse) GetValue() []byte {
 func (m *GetResponse) GetMinuteQps() float64 {
 	if m != nil && m.MinuteQps != nil {
 		return *m.MinuteQps
+	}
+	return 0
+}
+
+func (m *GetResponse) GetSize() int64 {
+	if m != nil && m.Size != nil {
+		return *m.Size
 	}
 	return 0
 }

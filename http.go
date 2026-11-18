@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -166,21 +167,75 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	group.Stats.ServerRequests.Add(1)
-	var value []byte
-	err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
+	var value ByteView
+	err := group.Get(ctx, key, ByteViewSink(&value))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Write the value to the response body as a proto message.
-	body, err := proto.Marshal(&pb.GetResponse{Value: value})
+	offset, limit, ranged, err := parseRangeRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if ranged {
+		if offset < 0 || offset > int64(value.Len()) {
+			http.Error(w, "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		end := int64(value.Len())
+		if limit > 0 && offset+limit < end {
+			end = offset + limit
+		}
+		frame := value.Slice(int(offset), int(end))
+		total := int64(value.Len())
+		// Only the requested frame is materialized and marshaled; the
+		// full object is never copied for the response.
+		body, err := proto.Marshal(&pb.GetResponse{Value: frame.bytesForMarshal(), Size: &total})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Write(body)
+		return
+	}
+
+	// Whole-object path (legacy requests without range parameters):
+	// write the cached view directly, without an extra clone.
+	body, err := proto.Marshal(&pb.GetResponse{Value: value.bytesForMarshal()})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Write(body)
+}
+
+// parseRangeRequest extracts the byte-range parameters added by
+// chunked peers. It returns ranged=false for legacy requests that
+// carry neither parameter.
+func parseRangeRequest(r *http.Request) (offset, limit int64, ranged bool, err error) {
+	offStr, hasOff := r.URL.Query()["offset"]
+	limStr, hasLim := r.URL.Query()["limit"]
+	if !hasOff && !hasLim {
+		return 0, 0, false, nil
+	}
+	ranged = true
+	if hasOff {
+		offset, err = strconv.ParseInt(offStr[0], 10, 64)
+		if err != nil {
+			return 0, 0, false, err
+		}
+	}
+	if hasLim {
+		limit, err = strconv.ParseInt(limStr[0], 10, 64)
+		if err != nil {
+			return 0, 0, false, err
+		}
+	}
+	return offset, limit, true, nil
 }
 
 type httpGetter struct {
@@ -193,12 +248,26 @@ var bufferPool = sync.Pool{
 }
 
 func (h *httpGetter) Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
+	return h.get(ctx, in, out, false)
+}
+
+// GetRange issues a bounded-frame request for a byte range of the
+// value. The reused response buffer only ever holds one frame, so
+// large objects do not accumulate in the transport layer.
+func (h *httpGetter) GetRange(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
+	return h.get(ctx, in, out, true)
+}
+
+func (h *httpGetter) get(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse, ranged bool) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",
 		h.baseURL,
 		url.QueryEscape(in.GetGroup()),
 		url.QueryEscape(in.GetKey()),
 	)
+	if ranged {
+		u = fmt.Sprintf("%s?offset=%d&limit=%d", u, in.GetOffset(), in.GetLimit())
+	}
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return err

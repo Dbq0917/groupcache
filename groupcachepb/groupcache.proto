@@ -21,11 +21,21 @@ package groupcachepb;
 message GetRequest {
   required string group = 1;
   required string key = 2; // not actually required/guaranteed to be UTF-8
+  // offset requests the value starting at this byte offset. A zero
+  // offset with a zero limit is a plain whole-object request, which
+  // legacy peers still understand.
+  optional int64 offset = 3;
+  // limit is the maximum number of bytes returned in this frame.
+  // The server may return fewer bytes; the last frame always does.
+  optional int64 limit = 4;
 }
 
 message GetResponse {
   optional bytes value = 1;
   optional double minute_qps = 2;
+  // size is the total length in bytes of the whole object. It is
+  // authoritative and lets the client size its receive buffer once.
+  optional int64 size = 3;
 }
 
 service GroupCache {
