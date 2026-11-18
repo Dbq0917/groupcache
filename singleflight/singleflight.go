@@ -22,9 +22,16 @@ import "sync"
 
 // call is an in-flight or completed Do call
 type call struct {
-	wg  sync.WaitGroup
-	val interface{}
-	err error
+	// chans holds one buffered channel per waiting caller. Each
+	// channel receives exactly one Result when the call completes.
+	chans []chan<- Result
+}
+
+// Result holds the results of a call, as delivered on the channel
+// returned by DoChan.
+type Result struct {
+	Val interface{}
+	Err error
 }
 
 // Group represents a class of work and forms a namespace in which
@@ -39,26 +46,45 @@ type Group struct {
 // time. If a duplicate comes in, the duplicate caller waits for the
 // original to complete and receives the same results.
 func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+	res := <-g.DoChan(key, fn)
+	return res.Val, res.Err
+}
+
+// DoChan is like Do but returns a channel that will receive the
+// results when they are ready. The channel is buffered and receives
+// exactly one result, so a caller is free to stop waiting (for
+// example when its own context is cancelled) without blocking or
+// leaking the shared call, and without affecting other callers
+// waiting on the same key.
+func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result {
+	ch := make(chan Result, 1)
 	g.mu.Lock()
 	if g.m == nil {
 		g.m = make(map[string]*call)
 	}
 	if c, ok := g.m[key]; ok {
+		c.chans = append(c.chans, ch)
 		g.mu.Unlock()
-		c.wg.Wait()
-		return c.val, c.err
+		return ch
 	}
 	c := new(call)
-	c.wg.Add(1)
+	c.chans = []chan<- Result{ch}
 	g.m[key] = c
 	g.mu.Unlock()
 
-	c.val, c.err = fn()
-	c.wg.Done()
+	go func() {
+		val, err := fn()
 
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
+		g.mu.Lock()
+		delete(g.m, key)
+		chans := c.chans
+		g.mu.Unlock()
 
-	return c.val, c.err
+		res := Result{Val: val, Err: err}
+		for _, ch := range chans {
+			ch <- res
+		}
+	}()
+
+	return ch
 }

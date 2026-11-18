@@ -181,8 +181,11 @@ type Group struct {
 // satisfies.  We define this so that we may test with an alternate
 // implementation.
 type flightGroup interface {
-	// Done is called when Do is done.
-	Do(key string, fn func() (interface{}, error)) (interface{}, error)
+	// DoChan is like singleflight.Group.DoChan: it suppresses
+	// duplicate calls for the same key and delivers the result on
+	// a buffered channel, so callers may stop waiting (e.g. when
+	// their own context is done) without affecting the shared call.
+	DoChan(key string, fn func() (interface{}, error)) <-chan singleflight.Result
 }
 
 // Stats are per-group statistics.
@@ -240,7 +243,14 @@ func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 // load loads key either by invoking the getter locally or by sending it to another machine.
 func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView, destPopulated bool, err error) {
 	g.Stats.Loads.Add(1)
-	viewi, err := g.loadGroup.Do(key, func() (interface{}, error) {
+	// The load is shared by every caller waiting on this key, so it
+	// must not be cancelled just because one caller (including the
+	// one that happened to start it) goes away. Detach cancellation
+	// from the caller's context while keeping its values (tracing,
+	// auth, ...) so an abandoned caller doesn't fail the whole group
+	// and the completed load still populates the cache.
+	loadCtx := context.WithoutCancel(ctx)
+	resCh := g.loadGroup.DoChan(key, func() (interface{}, error) {
 		// Check the cache again because singleflight can only dedup calls
 		// that overlap concurrently.  It's possible for 2 concurrent
 		// requests to miss the cache, resulting in 2 load() calls.  An
@@ -270,7 +280,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		var value ByteView
 		var err error
 		if peer, ok := g.peers.PickPeer(key); ok {
-			value, err = g.getFromPeer(ctx, peer, key)
+			value, err = g.getFromPeer(loadCtx, peer, key)
 			if err == nil {
 				g.Stats.PeerLoads.Add(1)
 				return value, nil
@@ -281,7 +291,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 			// probably boring (normal task movement), so not
 			// worth logging I imagine.
 		}
-		value, err = g.getLocally(ctx, key, dest)
+		value, err = g.getLocally(loadCtx, key, dest)
 		if err != nil {
 			g.Stats.LocalLoadErrs.Add(1)
 			return nil, err
@@ -291,8 +301,18 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		g.populateCache(key, value, &g.mainCache)
 		return value, nil
 	})
-	if err == nil {
-		value = viewi.(ByteView)
+	// Each caller waits with its own context: a caller whose context
+	// is done (timeout, client disconnect, ...) abandons the wait and
+	// returns its own error, while the shared load and the remaining
+	// callers on this key are unaffected.
+	select {
+	case res := <-resCh:
+		if res.Err == nil {
+			value = res.Val.(ByteView)
+		}
+		err = res.Err
+	case <-ctx.Done():
+		err = ctx.Err()
 	}
 	return
 }

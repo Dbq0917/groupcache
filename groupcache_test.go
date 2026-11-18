@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -33,6 +34,7 @@ import (
 	"github.com/golang/protobuf/proto"
 
 	pb "github.com/golang/groupcache/groupcachepb"
+	"github.com/golang/groupcache/singleflight"
 	testpb "github.com/golang/groupcache/testpb"
 )
 
@@ -375,12 +377,12 @@ type orderedFlightGroup struct {
 	orig   flightGroup
 }
 
-func (g *orderedFlightGroup) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+func (g *orderedFlightGroup) DoChan(key string, fn func() (interface{}, error)) <-chan singleflight.Result {
 	<-g.stage1
 	<-g.stage2
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.orig.Do(key, fn)
+	return g.orig.DoChan(key, fn)
 }
 
 // TestNoDedup tests invariants on the cache size when singleflight is
@@ -450,6 +452,82 @@ func TestGroupStatsAlignment(t *testing.T) {
 	off := unsafe.Offsetof(g.Stats)
 	if off%8 != 0 {
 		t.Fatal("Stats structure is not 8-byte aligned.")
+	}
+}
+
+// TestGetCallerAbandon verifies that a caller whose context is
+// cancelled while waiting on a deduped load can give up on its own,
+// without cancelling the shared load, failing other callers waiting
+// on the same key, or preventing the cache from being populated.
+func TestGetCallerAbandon(t *testing.T) {
+	const testkey = "abandonkey"
+	const testval = "abandonval"
+
+	getterEntered := make(chan struct{}, 1)
+	releaseGetter := make(chan struct{})
+	var calls int32
+	g := newGroup("abandongroup", 1024, GetterFunc(func(ctx context.Context, key string, dest Sink) error {
+		atomic.AddInt32(&calls, 1)
+		select {
+		case getterEntered <- struct{}{}:
+		default:
+		}
+		<-releaseGetter
+		// The load context is detached from any single caller, so it
+		// must still be alive here even after a caller cancelled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return dest.SetString(testval)
+	}), nil)
+
+	// First caller cancels while the shared load is still running.
+	ctx1, cancel := context.WithCancel(context.Background())
+	res1 := make(chan error, 1)
+	go func() {
+		var s string
+		res1 <- g.Get(ctx1, testkey, StringSink(&s))
+	}()
+
+	<-getterEntered
+
+	// Second caller attaches to the same in-flight load.
+	res2 := make(chan string, 1)
+	go func() {
+		var s string
+		if err := g.Get(context.Background(), testkey, StringSink(&s)); err != nil {
+			res2 <- "ERROR:" + err.Error()
+			return
+		}
+		res2 <- s
+	}()
+	time.Sleep(100 * time.Millisecond) // let the second caller attach
+
+	cancel()
+	if err := <-res1; err != context.Canceled {
+		t.Errorf("first Get = %v; want context.Canceled", err)
+	}
+
+	// The shared load is unaffected by the first caller leaving.
+	close(releaseGetter)
+	if got := <-res2; got != testval {
+		t.Errorf("second Get = %q; want %q", got, testval)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("getter calls = %d; want 1", got)
+	}
+
+	// The completed load populated the cache even though the caller
+	// that started it abandoned the wait.
+	var s string
+	if err := g.Get(context.Background(), testkey, StringSink(&s)); err != nil {
+		t.Fatalf("third Get: %v", err)
+	}
+	if s != testval {
+		t.Errorf("third Get = %q; want %q", s, testval)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("getter calls after cache hit = %d; want 1", got)
 	}
 }
 
