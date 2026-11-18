@@ -41,6 +41,20 @@ import (
 type Getter interface {
 	// Get returns the value identified by key, populating dest.
 	//
+	// A Getter must call exactly one of the Set methods on dest when
+	// it finds a value. The value may be empty.
+	//
+	// If the key does not exist, Get must return an error matching
+	// ErrNotFound (directly or wrapped). Returning nil without
+	// calling a Set method on dest is treated as ErrNotFound.
+	// ErrNotFound is an ordinary miss, not a load failure: it is
+	// returned to the caller, is not cached, and is not retried
+	// locally when it came from a peer.
+	//
+	// Any other error means the load failed. Load errors are not
+	// cached either. A Getter must not encode a miss as an empty
+	// value, since empty values are valid cached values.
+	//
 	// The returned data must be unversioned. That is, key must
 	// uniquely describe the loaded data, without an implicit
 	// current time, and without relying on cache expiration
@@ -209,6 +223,11 @@ func (g *Group) initPeers() {
 	}
 }
 
+// Get returns the value for key, loading it if necessary.
+//
+// If the value does not exist, Get returns an error matching
+// ErrNotFound. Like any other load error, a not-found result is not
+// cached.
 func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 	g.peersOnce.Do(g.initPeers)
 	g.Stats.Gets.Add(1)
@@ -275,6 +294,13 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 				g.Stats.PeerLoads.Add(1)
 				return value, nil
 			}
+			// The owner is authoritative for this key. If it
+			// says the key does not exist, do not fall back to
+			// the local Getter, which would duplicate the lookup
+			// and could return a different answer.
+			if IsNotFound(err) {
+				return nil, err
+			}
 			g.Stats.PeerErrors.Add(1)
 			// TODO(bradfitz): log the peer's error? keep
 			// log of the past few for /groupcachez?  It's
@@ -298,6 +324,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 }
 
 func (g *Group) getLocally(ctx context.Context, key string, dest Sink) (ByteView, error) {
+	resetSink(dest)
 	err := g.getter.Get(ctx, key, dest)
 	if err != nil {
 		return ByteView{}, err
@@ -314,6 +341,12 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	err := peer.Get(ctx, req, res)
 	if err != nil {
 		return ByteView{}, err
+	}
+	// A nil value means the peer omitted the field, which is how an
+	// older peer reports a miss. An empty but present value (for
+	// example an empty string) is a valid value and must be kept.
+	if res.Value == nil {
+		return ByteView{}, &ErrNotFound{Msg: "groupcache: peer returned no value"}
 	}
 	value := ByteView{b: res.Value}
 	// TODO(bradfitz): use res.MinuteQps or something smart to

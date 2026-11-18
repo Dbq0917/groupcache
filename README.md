@@ -59,6 +59,29 @@ In a nutshell, a groupcache lookup of **Get("foo")** looks like:
     the answer.  If the RPC fails, just load it locally (still with
     local dup suppression).
 
+## Missing values
+
+A cache miss is not the same thing as a missing value.
+
+When the key does not exist in the underlying data source, a `Getter`
+returns an error matching `groupcache.ErrNotFound` (it may wrap the
+sentinel). `Group.Get` returns that error to the caller; use
+`groupcache.IsNotFound` or `errors.Is` to detect it. A not-found result
+is not cached and is not retried against the local getter when the
+key's owner already reported it as missing.
+
+An empty value is a valid value. A `Getter` that finds an empty string
+or an empty byte slice must call the appropriate `Set` method and
+return `nil`; it must not use an empty value to signal a miss. A
+`Getter` that returns `nil` without setting the `Sink` is treated as
+`ErrNotFound`.
+
+Over HTTP, a missing value is reported with `404 Not Found` and is
+translated back into `ErrNotFound` by the peer client. Other load
+errors keep their existing behavior. At the RPC level, an omitted
+`GetResponse.value` field is also treated as a miss; a present but
+zero-length value is a valid empty value.
+
 ## Users
 
 groupcache is in production use by dl.google.com (its original user),

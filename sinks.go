@@ -48,6 +48,22 @@ func cloneBytes(b []byte) []byte {
 	return c
 }
 
+func errNoValue() error {
+	return &ErrNotFound{Msg: "groupcache: not found: Getter did not set a value"}
+}
+
+// sinkResetter is implemented by the package's Sinks so a reused Sink
+// does not treat a value set by an earlier Get as the result of this one.
+type sinkResetter interface {
+	reset()
+}
+
+func resetSink(s Sink) {
+	if r, ok := s.(sinkResetter); ok {
+		r.reset()
+	}
+}
+
 func setSinkView(s Sink, v ByteView) error {
 	// A viewSetter is a Sink that can also receive its value from
 	// a ByteView. This is a fast path to minimize copies when the
@@ -71,20 +87,28 @@ func StringSink(sp *string) Sink {
 }
 
 type stringSink struct {
-	sp *string
-	v  ByteView
-	// TODO(bradfitz): track whether any Sets were called.
+	sp  *string
+	v   ByteView
+	set bool
 }
 
 func (s *stringSink) view() (ByteView, error) {
-	// TODO(bradfitz): return an error if no Set was called
+	if !s.set {
+		return ByteView{}, errNoValue()
+	}
 	return s.v, nil
+}
+
+func (s *stringSink) reset() {
+	s.v = ByteView{}
+	s.set = false
 }
 
 func (s *stringSink) SetString(v string) error {
 	s.v.b = nil
 	s.v.s = v
 	*s.sp = v
+	s.set = true
 	return nil
 }
 
@@ -99,6 +123,7 @@ func (s *stringSink) SetProto(m proto.Message) error {
 	}
 	s.v.b = b
 	*s.sp = string(b)
+	s.set = true
 	return nil
 }
 
@@ -112,24 +137,27 @@ func ByteViewSink(dst *ByteView) Sink {
 
 type byteViewSink struct {
 	dst *ByteView
+	set bool
 
-	// if this code ever ends up tracking that at least one set*
-	// method was called, don't make it an error to call set
-	// methods multiple times. Lorry's payload.go does that, and
-	// it makes sense. The comment at the top of this file about
-	// "exactly one of the Set methods" is overly strict. We
-	// really care about at least once (in a handler), but if
-	// multiple handlers fail (or multiple functions in a program
-	// using a Sink), it's okay to re-use the same one.
+	// Multiple Set calls are allowed; only whether at least one
+	// succeeded matters.
 }
 
 func (s *byteViewSink) setView(v ByteView) error {
 	*s.dst = v
+	s.set = true
 	return nil
 }
 
 func (s *byteViewSink) view() (ByteView, error) {
+	if !s.set {
+		return ByteView{}, errNoValue()
+	}
 	return *s.dst, nil
+}
+
+func (s *byteViewSink) reset() {
+	s.set = false
 }
 
 func (s *byteViewSink) SetProto(m proto.Message) error {
@@ -138,16 +166,19 @@ func (s *byteViewSink) SetProto(m proto.Message) error {
 		return err
 	}
 	*s.dst = ByteView{b: b}
+	s.set = true
 	return nil
 }
 
 func (s *byteViewSink) SetBytes(b []byte) error {
 	*s.dst = ByteView{b: cloneBytes(b)}
+	s.set = true
 	return nil
 }
 
 func (s *byteViewSink) SetString(v string) error {
 	*s.dst = ByteView{s: v}
+	s.set = true
 	return nil
 }
 
@@ -162,11 +193,20 @@ type protoSink struct {
 	dst proto.Message // authoritative value
 	typ string
 
-	v ByteView // encoded
+	v   ByteView // encoded
+	set bool
 }
 
 func (s *protoSink) view() (ByteView, error) {
+	if !s.set {
+		return ByteView{}, errNoValue()
+	}
 	return s.v, nil
+}
+
+func (s *protoSink) reset() {
+	s.v = ByteView{}
+	s.set = false
 }
 
 func (s *protoSink) SetBytes(b []byte) error {
@@ -176,6 +216,7 @@ func (s *protoSink) SetBytes(b []byte) error {
 	}
 	s.v.b = cloneBytes(b)
 	s.v.s = ""
+	s.set = true
 	return nil
 }
 
@@ -187,6 +228,7 @@ func (s *protoSink) SetString(v string) error {
 	}
 	s.v.b = b
 	s.v.s = ""
+	s.set = true
 	return nil
 }
 
@@ -205,6 +247,7 @@ func (s *protoSink) SetProto(m proto.Message) error {
 	}
 	s.v.b = b
 	s.v.s = ""
+	s.set = true
 	return nil
 }
 
@@ -218,10 +261,19 @@ func AllocatingByteSliceSink(dst *[]byte) Sink {
 type allocBytesSink struct {
 	dst *[]byte
 	v   ByteView
+	set bool
 }
 
 func (s *allocBytesSink) view() (ByteView, error) {
+	if !s.set {
+		return ByteView{}, errNoValue()
+	}
 	return s.v, nil
+}
+
+func (s *allocBytesSink) reset() {
+	s.v = ByteView{}
+	s.set = false
 }
 
 func (s *allocBytesSink) setView(v ByteView) error {
@@ -231,6 +283,7 @@ func (s *allocBytesSink) setView(v ByteView) error {
 		*s.dst = []byte(v.s)
 	}
 	s.v = v
+	s.set = true
 	return nil
 }
 
@@ -253,6 +306,7 @@ func (s *allocBytesSink) setBytesOwned(b []byte) error {
 	*s.dst = cloneBytes(b) // another copy, protecting the read-only s.v.b view
 	s.v.b = b
 	s.v.s = ""
+	s.set = true
 	return nil
 }
 
@@ -263,6 +317,7 @@ func (s *allocBytesSink) SetString(v string) error {
 	*s.dst = []byte(v)
 	s.v.b = nil
 	s.v.s = v
+	s.set = true
 	return nil
 }
 
@@ -277,10 +332,19 @@ func TruncatingByteSliceSink(dst *[]byte) Sink {
 type truncBytesSink struct {
 	dst *[]byte
 	v   ByteView
+	set bool
 }
 
 func (s *truncBytesSink) view() (ByteView, error) {
+	if !s.set {
+		return ByteView{}, errNoValue()
+	}
 	return s.v, nil
+}
+
+func (s *truncBytesSink) reset() {
+	s.v = ByteView{}
+	s.set = false
 }
 
 func (s *truncBytesSink) SetProto(m proto.Message) error {
@@ -305,6 +369,7 @@ func (s *truncBytesSink) setBytesOwned(b []byte) error {
 	}
 	s.v.b = b
 	s.v.s = ""
+	s.set = true
 	return nil
 }
 
@@ -318,5 +383,6 @@ func (s *truncBytesSink) SetString(v string) error {
 	}
 	s.v.b = nil
 	s.v.s = v
+	s.set = true
 	return nil
 }
