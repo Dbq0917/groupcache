@@ -185,6 +185,24 @@ type flightGroup interface {
 	Do(key string, fn func() (interface{}, error)) (interface{}, error)
 }
 
+// handoffContextKey marks requests that are themselves handoff
+// fetches from a previous owner. Such requests must be served
+// locally (cache or Getter) without consulting the peer ring again,
+// which prevents forwarding loops when two peers disagree about
+// ownership during a ring transition.
+type handoffContextKey struct{}
+
+// withHandoff returns a context marked as a handoff fetch.
+func withHandoff(ctx context.Context) context.Context {
+	return context.WithValue(ctx, handoffContextKey{}, true)
+}
+
+// isHandoff reports whether ctx carries the handoff marker.
+func isHandoff(ctx context.Context) bool {
+	v, _ := ctx.Value(handoffContextKey{}).(bool)
+	return v
+}
+
 // Stats are per-group statistics.
 type Stats struct {
 	Gets           AtomicInt // any Get request, including from peers
@@ -196,6 +214,8 @@ type Stats struct {
 	LocalLoads     AtomicInt // total good local loads
 	LocalLoadErrs  AtomicInt // total bad local loads
 	ServerRequests AtomicInt // gets that came over the network from peers
+	HandoffLoads   AtomicInt // loads served by a key's previous owner during a ring transition
+	HandoffErrors  AtomicInt // failed handoff fetches (fell back to the local Getter)
 }
 
 // Name returns the name of the group.
@@ -269,17 +289,33 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		g.Stats.LoadsDeduped.Add(1)
 		var value ByteView
 		var err error
-		if peer, ok := g.peers.PickPeer(key); ok {
-			value, err = g.getFromPeer(ctx, peer, key)
-			if err == nil {
-				g.Stats.PeerLoads.Add(1)
-				return value, nil
+		if !isHandoff(ctx) {
+			if peer, ok := g.peers.PickPeer(key); ok {
+				value, err = g.getFromPeer(ctx, peer, key)
+				if err == nil {
+					g.Stats.PeerLoads.Add(1)
+					return value, nil
+				}
+				g.Stats.PeerErrors.Add(1)
+				// TODO(bradfitz): log the peer's error? keep
+				// log of the past few for /groupcachez?  It's
+				// probably boring (normal task movement), so not
+				// worth logging I imagine.
+			} else if hp, ok := g.peers.(HandoffPicker); ok {
+				// This peer is the key's owner under the current
+				// ring. If the ring just changed and the previous
+				// owner is still reachable, fetch from its (likely
+				// warm) cache instead of hitting the Getter.
+				if prev, ok := hp.PickPreviousOwner(key); ok {
+					value, err = g.getFromHandoffPeer(ctx, prev, key)
+					if err == nil {
+						g.Stats.HandoffLoads.Add(1)
+						g.populateCache(key, value, &g.mainCache)
+						return value, nil
+					}
+					g.Stats.HandoffErrors.Add(1)
+				}
 			}
-			g.Stats.PeerErrors.Add(1)
-			// TODO(bradfitz): log the peer's error? keep
-			// log of the past few for /groupcachez?  It's
-			// probably boring (normal task movement), so not
-			// worth logging I imagine.
 		}
 		value, err = g.getLocally(ctx, key, dest)
 		if err != nil {
@@ -329,6 +365,22 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 		g.populateCache(key, value, &g.hotCache)
 	}
 	return value, nil
+}
+
+// getFromHandoffPeer fetches key from its previous owner during a
+// ring transition. The request is marked so the serving peer answers
+// from its local cache or Getter without forwarding it further.
+func (g *Group) getFromHandoffPeer(ctx context.Context, peer ProtoGetter, key string) (ByteView, error) {
+	req := &pb.GetRequest{
+		Group: &g.name,
+		Key:   &key,
+	}
+	res := &pb.GetResponse{}
+	err := peer.Get(withHandoff(ctx), req, res)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{b: res.Value}, nil
 }
 
 func (g *Group) lookupCache(key string) (value ByteView, ok bool) {

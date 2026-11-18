@@ -59,6 +59,35 @@ In a nutshell, a groupcache lookup of **Get("foo")** looks like:
     the answer.  If the RPC fails, just load it locally (still with
     local dup suppression).
 
+## Ring updates and resharding
+
+Adding or removing peers changes the consistent hash ring. Two
+mechanisms keep that fast and cheap:
+
+ * **Versioned rings with anti-entropy.** `HTTPPool.SetWithVersion`
+   installs a peer list together with a monotonically increasing
+   version (assigned by whatever pushes the configuration, e.g. a
+   Unix timestamp). Stale or out-of-order broadcasts are rejected.
+   Every peer response carries the serving peer's ring version in the
+   `X-Groupcache-Ring-Version` header; a peer that observes a newer
+   version immediately pulls the full ring state from that peer's
+   `/_groupcache/_ring` endpoint, so the cluster converges within a
+   request round-trip instead of waiting for the next broadcast.
+   The legacy unversioned `HTTPPool.Set` keeps its historical
+   always-apply behavior.
+
+ * **Handoff reads.** When `HTTPPoolOptions.TransitionWindow` is
+   non-zero, the previous ring is kept for that long after each
+   update. If a key moved to a new owner and the new owner misses
+   locally, it fetches the value from the previous owner's (likely
+   still warm) cache instead of hitting the underlying getter, and
+   populates its own cache with the result. Refill load is therefore
+   spread across all previous owners and bounded by the window,
+   instead of landing on the backing store all at once. Handoff
+   requests are marked (`?handoff=1`) and are always served locally,
+   so they can never be forwarded back and forth between peers that
+   disagree about ownership.
+
 ## Users
 
 groupcache is in production use by dl.google.com (its original user),

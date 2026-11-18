@@ -41,6 +41,21 @@ type PeerPicker interface {
 	PickPeer(key string) (peer ProtoGetter, ok bool)
 }
 
+// HandoffPicker is an optional interface that a PeerPicker can
+// implement to smooth ownership transitions after the peer set
+// changes. While a transition window is open, the new owner of a key
+// may fetch a locally-missed value from the key's previous owner
+// (which likely still holds it in cache) instead of hitting the
+// underlying Getter, spreading the refill load across the old peers
+// and keeping the cache hit rate stable during reshardings.
+type HandoffPicker interface {
+	// PickPreviousOwner returns the peer that owned the key under
+	// the previous version of the peer set, if a handoff window is
+	// still open and the key's ownership changed. It returns
+	// nil, false when no handoff applies to the key.
+	PickPreviousOwner(key string) (peer ProtoGetter, ok bool)
+}
+
 // NoPeers is an implementation of PeerPicker that never finds a peer.
 type NoPeers struct{}
 
