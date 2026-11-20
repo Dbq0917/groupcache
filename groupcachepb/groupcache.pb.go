@@ -40,6 +40,9 @@ func (m *GetRequest) GetKey() string {
 type GetResponse struct {
 	Value            []byte   `protobuf:"bytes,1,opt,name=value" json:"value,omitempty"`
 	MinuteQps        *float64 `protobuf:"fixed64,2,opt,name=minute_qps" json:"minute_qps,omitempty"`
+	RingVersion      *uint64  `protobuf:"varint,3,opt,name=ring_version" json:"ring_version,omitempty"`
+	ValueRingVersion *uint64  `protobuf:"varint,4,opt,name=value_ring_version" json:"value_ring_version,omitempty"`
+	ValueVersion     *uint64  `protobuf:"varint,5,opt,name=value_version" json:"value_version,omitempty"`
 	XXX_unrecognized []byte   `json:"-"`
 }
 
@@ -57,6 +60,27 @@ func (m *GetResponse) GetValue() []byte {
 func (m *GetResponse) GetMinuteQps() float64 {
 	if m != nil && m.MinuteQps != nil {
 		return *m.MinuteQps
+	}
+	return 0
+}
+
+func (m *GetResponse) GetRingVersion() uint64 {
+	if m != nil && m.RingVersion != nil {
+		return *m.RingVersion
+	}
+	return 0
+}
+
+func (m *GetResponse) GetValueRingVersion() uint64 {
+	if m != nil && m.ValueRingVersion != nil {
+		return *m.ValueRingVersion
+	}
+	return 0
+}
+
+func (m *GetResponse) GetValueVersion() uint64 {
+	if m != nil && m.ValueVersion != nil {
+		return *m.ValueVersion
 	}
 	return 0
 }

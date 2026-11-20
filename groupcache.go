@@ -172,6 +172,11 @@ type Group struct {
 	// Stats are statistics on the group.
 	Stats Stats
 
+	// valueClock provides a per-process Lamport clock for cache
+	// entries. It lets a newer copy replace an older handoff copy
+	// when two owners temporarily hold the same key.
+	valueClock AtomicInt
+
 	// rand is only non-nil when testing,
 	// to get predictable results in TestPeers.
 	rand *rand.Rand
@@ -185,6 +190,37 @@ type flightGroup interface {
 	Do(key string, fn func() (interface{}, error)) (interface{}, error)
 }
 
+// handoffContextKey marks a request that fetches a key from its
+// previous owner during a ring transition. Such a request must be
+// served from that peer's local cache or Getter without consulting
+// the ring again, otherwise two peers that briefly disagree about
+// ownership can forward the request forever.
+type handoffContextKey struct{}
+
+func withHandoff(ctx context.Context) context.Context {
+	return context.WithValue(ctx, handoffContextKey{}, true)
+}
+
+func isHandoff(ctx context.Context) bool {
+	v, _ := ctx.Value(handoffContextKey{}).(bool)
+	return v
+}
+
+// valueVersion orders copies of a key that temporarily coexist on
+// two peers. The ring version is compared first, then the Lamport
+// clock for values produced under the same ring.
+type valueVersion struct {
+	ring uint64
+	seq  uint64
+}
+
+func (a valueVersion) newerThan(b valueVersion) bool {
+	if a.ring != b.ring {
+		return a.ring > b.ring
+	}
+	return a.seq > b.seq
+}
+
 // Stats are per-group statistics.
 type Stats struct {
 	Gets           AtomicInt // any Get request, including from peers
@@ -196,6 +232,8 @@ type Stats struct {
 	LocalLoads     AtomicInt // total good local loads
 	LocalLoadErrs  AtomicInt // total bad local loads
 	ServerRequests AtomicInt // gets that came over the network from peers
+	HandoffLoads   AtomicInt // loads served from a previous owner during a ring transition
+	HandoffErrors  AtomicInt // failed handoffs that fell back to the local Getter
 }
 
 // Name returns the name of the group.
@@ -215,7 +253,7 @@ func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 	if dest == nil {
 		return errors.New("groupcache: nil dest Sink")
 	}
-	value, cacheHit := g.lookupCache(key)
+	value, cacheHit := g.lookupCacheFor(ctx, key)
 
 	if cacheHit {
 		g.Stats.CacheHits.Add(1)
@@ -232,6 +270,15 @@ func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 		return err
 	}
 	if destPopulated {
+		// Preserve the value metadata (ring/value version) for
+		// sinks that can accept a ByteView. The Getter already
+		// populated the bytes, but not the cache bookkeeping.
+		type viewSetter interface {
+			setView(ByteView) error
+		}
+		if vs, ok := dest.(viewSetter); ok {
+			return vs.setView(value)
+		}
 		return nil
 	}
 	return setSinkView(dest, value)
@@ -262,24 +309,41 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		// 1: fn()
 		// 2: loadGroup.Do("key", fn)
 		// 2: fn()
-		if value, cacheHit := g.lookupCache(key); cacheHit {
+		if value, cacheHit := g.lookupCacheFor(ctx, key); cacheHit {
 			g.Stats.CacheHits.Add(1)
 			return value, nil
 		}
 		g.Stats.LoadsDeduped.Add(1)
 		var value ByteView
 		var err error
-		if peer, ok := g.peers.PickPeer(key); ok {
-			value, err = g.getFromPeer(ctx, peer, key)
-			if err == nil {
-				g.Stats.PeerLoads.Add(1)
-				return value, nil
+		if !isHandoff(ctx) {
+			if peer, ok := g.peers.PickPeer(key); ok {
+				value, err = g.getFromPeer(ctx, peer, key)
+				if err == nil {
+					g.Stats.PeerLoads.Add(1)
+					return value, nil
+				}
+				g.Stats.PeerErrors.Add(1)
+				// TODO(bradfitz): log the peer's error? keep
+				// log of the past few for /groupcachez?  It's
+				// probably boring (normal task movement), so not
+				// worth logging I imagine.
+			} else if hp, ok := g.peers.(HandoffPicker); ok {
+				// This peer owns the key under the current ring.
+				// If it just became the owner, try the previous
+				// owner's warm cache before falling back to the
+				// underlying Getter. The handoff is lazy, so the
+				// refill load stays spread across old owners.
+				if prev, ok := hp.PickPreviousOwner(key); ok {
+					value, err = g.getFromHandoffPeer(ctx, prev, key)
+					if err == nil {
+						g.Stats.HandoffLoads.Add(1)
+						g.populateCache(key, value, &g.mainCache)
+						return value, nil
+					}
+					g.Stats.HandoffErrors.Add(1)
+				}
 			}
-			g.Stats.PeerErrors.Add(1)
-			// TODO(bradfitz): log the peer's error? keep
-			// log of the past few for /groupcachez?  It's
-			// probably boring (normal task movement), so not
-			// worth logging I imagine.
 		}
 		value, err = g.getLocally(ctx, key, dest)
 		if err != nil {
@@ -288,7 +352,13 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		}
 		g.Stats.LocalLoads.Add(1)
 		destPopulated = true // only one caller of load gets this return value
-		g.populateCache(key, value, &g.mainCache)
+		value = g.stampValue(value)
+		// A handoff is a read from the old owner. Do not write the
+		// value back into that peer's cache: the final owner is the
+		// only peer that should persist a refill.
+		if !isHandoff(ctx) {
+			g.populateCache(key, value, &g.mainCache)
+		}
 		return value, nil
 	})
 	if err == nil {
@@ -315,7 +385,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	if err != nil {
 		return ByteView{}, err
 	}
-	value := ByteView{b: res.Value}
+	value := g.valueFromResponse(res)
 	// TODO(bradfitz): use res.MinuteQps or something smart to
 	// conditionally populate hotCache.  For now just do it some
 	// percentage of the time.
@@ -331,16 +401,102 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	return value, nil
 }
 
+// getFromHandoffPeer fetches key from the previous owner during a
+// ring transition. The request is marked so the serving peer answers
+// from its local cache or Getter without forwarding it again.
+func (g *Group) getFromHandoffPeer(ctx context.Context, peer ProtoGetter, key string) (ByteView, error) {
+	req := &pb.GetRequest{
+		Group: &g.name,
+		Key:   &key,
+	}
+	res := &pb.GetResponse{}
+	if err := peer.Get(withHandoff(ctx), req, res); err != nil {
+		return ByteView{}, err
+	}
+	return g.valueFromResponse(res), nil
+}
+
+func (g *Group) valueFromResponse(res *pb.GetResponse) ByteView {
+	value := ByteView{b: res.Value}
+	if res.ValueRingVersion != nil {
+		value.version.ring = res.GetValueRingVersion()
+	}
+	if res.ValueVersion != nil {
+		value.version.seq = res.GetValueVersion()
+	}
+	if value.version.ring == 0 && res.RingVersion != nil {
+		value.version.ring = res.GetRingVersion()
+	}
+	g.observeValueVersion(value.version)
+	return value
+}
+
+func (g *Group) currentRingVersion() uint64 {
+	if rv, ok := g.peers.(RingVersioner); ok {
+		return rv.RingVersion()
+	}
+	return 0
+}
+
+func (g *Group) stampValue(value ByteView) ByteView {
+	value.version = valueVersion{
+		ring: g.currentRingVersion(),
+		seq:  uint64(g.valueClock.AddAndGet(1)),
+	}
+	return value
+}
+
+func (g *Group) observeValueVersion(version valueVersion) {
+	for {
+		current := uint64(g.valueClock.Get())
+		if version.seq <= current {
+			return
+		}
+		if atomic.CompareAndSwapInt64((*int64)(&g.valueClock), int64(current), int64(version.seq)) {
+			return
+		}
+	}
+}
+
+func (g *Group) ownsKey(key string) bool {
+	if g.peers == nil {
+		return true
+	}
+	_, remote := g.peers.PickPeer(key)
+	return !remote
+}
+
 func (g *Group) lookupCache(key string) (value ByteView, ok bool) {
+	return g.lookupCacheFor(context.Background(), key)
+}
+
+func (g *Group) lookupCacheFor(ctx context.Context, key string) (value ByteView, ok bool) {
 	if g.cacheBytes <= 0 {
 		return
 	}
-	value, ok = g.mainCache.get(key)
-	if ok {
-		return
+	ringVersion := g.currentRingVersion()
+	owner := g.ownsKey(key)
+
+	// mainCache is authoritative only while this peer owns the key.
+	// Once a ring update moves the key away, skip the stale entry and
+	// forward the read to the final owner. A handoff request is the
+	// exception: it is explicitly asking this previous owner for its
+	// old copy.
+	if value, ok = g.mainCache.get(key); ok {
+		if owner || isHandoff(ctx) {
+			return value, true
+		}
 	}
-	value, ok = g.hotCache.get(key)
-	return
+
+	// hotCache is a mirror, not the authority. Entries created under
+	// an older ring may describe an owner that has since changed, so
+	// only serve mirrors known to belong to the current ring.
+	if value, ok = g.hotCache.get(key); ok {
+		if ringVersion == 0 || value.version.ring >= ringVersion {
+			return value, true
+		}
+	}
+	return ByteView{}, false
 }
 
 func (g *Group) populateCache(key string, value ByteView, cache *cache) {
@@ -429,6 +585,14 @@ func (c *cache) add(key string, value ByteView) {
 			},
 		}
 	}
+	if vi, ok := c.lru.Get(key); ok {
+		old := vi.(ByteView)
+		if old.version.newerThan(value.version) ||
+			(old.version == value.version && value.version != (valueVersion{})) {
+			return
+		}
+		c.nbytes -= int64(len(key)) + int64(old.Len())
+	}
 	c.lru.Add(key, value)
 	c.nbytes += int64(len(key)) + int64(value.Len())
 }
@@ -481,6 +645,11 @@ type AtomicInt int64
 // Add atomically adds n to i.
 func (i *AtomicInt) Add(n int64) {
 	atomic.AddInt64((*int64)(i), n)
+}
+
+// AddAndGet atomically adds n to i and returns the new value.
+func (i *AtomicInt) AddAndGet(n int64) int64 {
+	return atomic.AddInt64((*int64)(i), n)
 }
 
 // Get atomically gets the value of i.

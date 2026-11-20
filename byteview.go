@@ -33,6 +33,10 @@ type ByteView struct {
 	// If b is non-nil, b is used, else s is used.
 	b []byte
 	s string
+
+	// version is cache bookkeeping. It is intentionally not part of
+	// the value's byte representation.
+	version valueVersion
 }
 
 // Len returns the view's length.
@@ -70,17 +74,17 @@ func (v ByteView) At(i int) byte {
 // Slice slices the view between the provided from and to indices.
 func (v ByteView) Slice(from, to int) ByteView {
 	if v.b != nil {
-		return ByteView{b: v.b[from:to]}
+		return ByteView{b: v.b[from:to], version: v.version}
 	}
-	return ByteView{s: v.s[from:to]}
+	return ByteView{s: v.s[from:to], version: v.version}
 }
 
 // SliceFrom slices the view from the provided index until the end.
 func (v ByteView) SliceFrom(from int) ByteView {
 	if v.b != nil {
-		return ByteView{b: v.b[from:]}
+		return ByteView{b: v.b[from:], version: v.version}
 	}
-	return ByteView{s: v.s[from:]}
+	return ByteView{s: v.s[from:], version: v.version}
 }
 
 // Copy copies b into dest and returns the number of bytes copied.

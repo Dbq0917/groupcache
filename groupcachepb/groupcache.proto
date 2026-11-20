@@ -26,6 +26,12 @@ message GetRequest {
 message GetResponse {
   optional bytes value = 1;
   optional double minute_qps = 2;
+  // Ring version of the peer that served this response.
+  optional uint64 ring_version = 3;
+  // Version of the cached value and the ring under which it was
+  // produced. These let a new owner reject an older handoff copy.
+  optional uint64 value_ring_version = 4;
+  optional uint64 value_version = 5;
 }
 
 service GroupCache {

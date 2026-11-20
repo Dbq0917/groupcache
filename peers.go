@@ -41,6 +41,26 @@ type PeerPicker interface {
 	PickPeer(key string) (peer ProtoGetter, ok bool)
 }
 
+// HandoffPicker is an optional interface implemented by PeerPickers
+// that can locate a key's owner under the previous ring. It is used
+// only while a ring transition is in progress: the new owner fetches
+// a missing value from the previous owner's warm cache instead of
+// loading it from the underlying store. Handoffs are therefore lazy
+// and spread across all previous owners rather than being pushed
+// through one migration process.
+type HandoffPicker interface {
+	// PickPreviousOwner returns the key's previous owner if ownership
+	// changed with the current ring and the handoff window is open.
+	PickPreviousOwner(key string) (peer ProtoGetter, ok bool)
+}
+
+// RingVersioner is implemented by peer pickers whose ring is
+// versioned. It lets the cache decide whether a locally mirrored
+// value was produced under the current ring.
+type RingVersioner interface {
+	RingVersion() uint64
+}
+
 // NoPeers is an implementation of PeerPicker that never finds a peer.
 type NoPeers struct{}
 
