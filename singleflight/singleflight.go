@@ -18,7 +18,15 @@ limitations under the License.
 // mechanism.
 package singleflight
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
+
+// DefaultErrSuppressWindow is the default amount of time the result of
+// a failed Do call is kept for duplicate suppression.  See
+// Group.ErrSuppressWindow.
+const DefaultErrSuppressWindow = 100 * time.Millisecond
 
 // call is an in-flight or completed Do call
 type call struct {
@@ -30,8 +38,29 @@ type call struct {
 // Group represents a class of work and forms a namespace in which
 // units of work can be executed with duplicate suppression.
 type Group struct {
+	// ErrSuppressWindow is how long the error result of a failed
+	// call remains available for duplicate suppression after the
+	// call completes.  While a failed call is retained, additional
+	// Do calls for the same key (e.g. retries) receive the same
+	// error instead of re-invoking fn, so a burst of failures
+	// against a slow or struggling backend collapses into a single
+	// execution.  Successful calls are never retained: their
+	// duplicates are only suppressed while in-flight, as before.
+	//
+	// If zero, DefaultErrSuppressWindow is used.  If negative,
+	// failed calls are forgotten immediately (the historical
+	// behavior).
+	ErrSuppressWindow time.Duration
+
 	mu sync.Mutex       // protects m
 	m  map[string]*call // lazily initialized
+}
+
+func (g *Group) errSuppressWindow() time.Duration {
+	if g.ErrSuppressWindow == 0 {
+		return DefaultErrSuppressWindow
+	}
+	return g.ErrSuppressWindow
 }
 
 // Do executes and returns the results of the given function, making
@@ -55,6 +84,23 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 
 	c.val, c.err = fn()
 	c.wg.Done()
+
+	if c.err != nil {
+		if window := g.errSuppressWindow(); window > 0 {
+			// Keep the failed call in the map for a short
+			// window so that concurrent retries for the same
+			// key are suppressed onto this error instead of
+			// each re-invoking fn against the backend.
+			time.AfterFunc(window, func() {
+				g.mu.Lock()
+				if g.m[key] == c {
+					delete(g.m, key)
+				}
+				g.mu.Unlock()
+			})
+			return c.val, c.err
+		}
+	}
 
 	g.mu.Lock()
 	delete(g.m, key)

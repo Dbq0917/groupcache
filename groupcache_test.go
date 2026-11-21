@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -442,6 +443,70 @@ func TestNoDedup(t *testing.T) {
 	const wantBytes = int64(len(testkey) + len(testval))
 	if g.mainCache.nbytes != wantBytes {
 		t.Errorf("cache has %d bytes, want %d", g.mainCache.nbytes, wantBytes)
+	}
+}
+
+// TestGetErrorDupSuppress tests that when many concurrent Gets miss
+// the cache for the same key and the getter fails, the getter is only
+// invoked once: the failure is shared with all callers, and retries
+// arriving shortly afterwards are also suppressed instead of each
+// hitting the getter again.
+func TestGetErrorDupSuppress(t *testing.T) {
+	const testkey = "hot-key"
+	getterErr := errors.New("getter failed")
+	var fills int32
+	g := newGroup("error-dedup-group", cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		atomic.AddInt32(&fills, 1)
+		// Simulate a slow origin so all 100 requests overlap
+		// on the same in-flight load.
+		time.Sleep(100 * time.Millisecond)
+		return getterErr
+	}), nil)
+
+	const n = 100
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var s string
+			errs <- g.Get(dummyCtx, testkey, StringSink(&s))
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != getterErr {
+			t.Errorf("Get error = %v; want %v", err, getterErr)
+		}
+	}
+	if got := atomic.LoadInt32(&fills); got != 1 {
+		t.Errorf("getter invoked %d times for %d concurrent misses; want 1", got, n)
+	}
+
+	// A retry arriving right after the failure is still within the
+	// error suppression window and must not hit the getter again.
+	var s string
+	if err := g.Get(dummyCtx, testkey, StringSink(&s)); err != getterErr {
+		t.Errorf("Get error = %v; want %v", err, getterErr)
+	}
+	if got := atomic.LoadInt32(&fills); got != 1 {
+		t.Errorf("getter invoked %d times after suppressed retry; want 1", got)
+	}
+
+	// Once the suppression window (default 100ms) has elapsed, a
+	// retry reaches the getter again, exactly once.
+	time.Sleep(500 * time.Millisecond)
+	if err := g.Get(dummyCtx, testkey, StringSink(&s)); err != getterErr {
+		t.Errorf("Get error = %v; want %v", err, getterErr)
+	}
+	if got := atomic.LoadInt32(&fills); got != 2 {
+		t.Errorf("getter invoked %d times after window expiry; want 2", got)
+	}
+
+	// Failures must not be cached: the key is still absent.
+	if _, ok := g.lookupCache(testkey); ok {
+		t.Errorf("failed key %q present in cache", testkey)
 	}
 }
 

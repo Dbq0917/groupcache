@@ -164,7 +164,10 @@ type Group struct {
 
 	// loadGroup ensures that each key is only fetched once
 	// (either locally or remotely), regardless of the number of
-	// concurrent callers.
+	// concurrent callers.  Failed loads are also deduped for a
+	// brief window (see singleflight.Group.ErrSuppressWindow) so
+	// that a burst of concurrent misses followed by retries does
+	// not hammer the getter once per caller.
 	loadGroup flightGroup
 
 	_ int32 // force Stats to be 8-byte aligned on 32-bit platforms

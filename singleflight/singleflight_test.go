@@ -83,3 +83,94 @@ func TestDoDupSuppress(t *testing.T) {
 		t.Errorf("number of calls = %d; want 1", got)
 	}
 }
+
+// TestDoErrDupSuppress tests that a failed call's error is shared not
+// only with concurrent duplicates, but also with callers (retries)
+// that arrive shortly after the failure, within ErrSuppressWindow.
+func TestDoErrDupSuppress(t *testing.T) {
+	var g Group
+	g.ErrSuppressWindow = time.Second
+	someErr := errors.New("some error")
+	var calls int32
+	fn := func() (interface{}, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, someErr
+	}
+
+	const n = 10
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if v, err := g.Do("key", fn); err != someErr {
+				t.Errorf("Do = %v, %v; want error %v", v, err, someErr)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("number of calls = %d; want 1", got)
+	}
+
+	// A retry arriving after the failure (but within the
+	// suppression window) gets the retained error instead of
+	// re-invoking fn.
+	if v, err := g.Do("key", fn); err != someErr {
+		t.Errorf("Do = %v, %v; want error %v", v, err, someErr)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("number of calls after suppressed retry = %d; want 1", got)
+	}
+}
+
+// TestDoErrSuppressExpiry tests that once ErrSuppressWindow elapses,
+// the next call for the key executes fn again.
+func TestDoErrSuppressExpiry(t *testing.T) {
+	var g Group
+	g.ErrSuppressWindow = 50 * time.Millisecond
+	someErr := errors.New("some error")
+	var calls int32
+	fn := func() (interface{}, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, someErr
+	}
+
+	if _, err := g.Do("key", fn); err != someErr {
+		t.Fatalf("Do error = %v; want %v", err, someErr)
+	}
+	if _, err := g.Do("key", fn); err != someErr {
+		t.Fatalf("Do error = %v; want %v", err, someErr)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("number of calls = %d; want 1", got)
+	}
+
+	time.Sleep(200 * time.Millisecond) // let the suppression window expire
+	if _, err := g.Do("key", fn); err != someErr {
+		t.Fatalf("Do error = %v; want %v", err, someErr)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("number of calls after window expiry = %d; want 2", got)
+	}
+}
+
+// TestDoSuccessNotRetained tests that successful calls are forgotten
+// as soon as they complete: back-to-back calls for the same key each
+// execute fn.
+func TestDoSuccessNotRetained(t *testing.T) {
+	var g Group
+	var calls int32
+	fn := func() (interface{}, error) {
+		atomic.AddInt32(&calls, 1)
+		return "bar", nil
+	}
+	for i := 0; i < 2; i++ {
+		if v, err := g.Do("key", fn); err != nil || v.(string) != "bar" {
+			t.Fatalf("Do = %v, %v; want bar, nil", v, err)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("number of calls = %d; want 2", got)
+	}
+}
