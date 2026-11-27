@@ -167,6 +167,15 @@ type Group struct {
 	// concurrent callers.
 	loadGroup flightGroup
 
+	// invalidateMu guards invalidations and invalidateGen.
+	// invalidations records the invalidation generation of the most
+	// recent Delete for each key. A load that was already in flight when
+	// a Delete happened compares the generation it observed at start with
+	// the current one and skips writing its (now stale) result back.
+	invalidateMu  sync.Mutex
+	invalidations map[string]int64
+	invalidateGen int64
+
 	_ int32 // force Stats to be 8-byte aligned on 32-bit platforms
 
 	// Stats are statistics on the group.
@@ -241,6 +250,10 @@ func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView, destPopulated bool, err error) {
 	g.Stats.Loads.Add(1)
 	viewi, err := g.loadGroup.Do(key, func() (interface{}, error) {
+		// Record the latest invalidation generation before loading. If a
+		// Delete for this key happens while the load is in flight, the
+		// generation advances and the result below must not be cached.
+		loadGen := g.invalidationGeneration(key)
 		// Check the cache again because singleflight can only dedup calls
 		// that overlap concurrently.  It's possible for 2 concurrent
 		// requests to miss the cache, resulting in 2 load() calls.  An
@@ -270,7 +283,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		var value ByteView
 		var err error
 		if peer, ok := g.peers.PickPeer(key); ok {
-			value, err = g.getFromPeer(ctx, peer, key)
+			value, err = g.getFromPeer(ctx, peer, key, loadGen)
 			if err == nil {
 				g.Stats.PeerLoads.Add(1)
 				return value, nil
@@ -288,7 +301,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		}
 		g.Stats.LocalLoads.Add(1)
 		destPopulated = true // only one caller of load gets this return value
-		g.populateCache(key, value, &g.mainCache)
+		g.populateIfFresh(key, value, &g.mainCache, loadGen)
 		return value, nil
 	})
 	if err == nil {
@@ -305,7 +318,7 @@ func (g *Group) getLocally(ctx context.Context, key string, dest Sink) (ByteView
 	return dest.view()
 }
 
-func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (ByteView, error) {
+func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string, loadGen int64) (ByteView, error) {
 	req := &pb.GetRequest{
 		Group: &g.name,
 		Key:   &key,
@@ -326,7 +339,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 		pop = rand.Intn(10) == 0
 	}
 	if pop {
-		g.populateCache(key, value, &g.hotCache)
+		g.populateIfFresh(key, value, &g.hotCache, loadGen)
 	}
 	return value, nil
 }
@@ -366,6 +379,72 @@ func (g *Group) populateCache(key string, value ByteView, cache *cache) {
 		}
 		victim.removeOldest()
 	}
+}
+
+// Delete removes key from the group's caches.
+//
+// If this process is not the key's owner, Delete forwards the
+// invalidation to the owner; deleting only the local mirror would be
+// undone on the next Get, which would fetch the stale value back from
+// the owner. The owner then drops the key from both its mainCache and
+// any hotCache copy.
+//
+// A load already in flight for key is allowed to finish, but its result
+// is not written back into the caches when a Delete happened while it was
+// running, so the next Get reloads the current value rather than
+// resurrecting the deleted one.
+func (g *Group) Delete(ctx context.Context, key string) error {
+	g.peersOnce.Do(g.initPeers)
+	if peer, ok := g.peers.PickPeer(key); ok {
+		req := &pb.GetRequest{
+			Group: &g.name,
+			Key:   &key,
+		}
+		if err := peer.Delete(ctx, req, &pb.GetResponse{}); err != nil {
+			return err
+		}
+	}
+	g.invalidate(key)
+	return nil
+}
+
+// invalidate drops key from both local caches and advances its
+// invalidation generation so in-flight loads cannot write it back.
+func (g *Group) invalidate(key string) {
+	g.invalidateMu.Lock()
+	if g.invalidations == nil {
+		g.invalidations = make(map[string]int64)
+	}
+	g.invalidateGen++
+	g.invalidations[key] = g.invalidateGen
+	g.invalidateMu.Unlock()
+
+	g.mainCache.remove(key)
+	g.hotCache.remove(key)
+}
+
+// invalidationGeneration returns the invalidation generation current for
+// key, or zero if key has never been deleted on this process.
+func (g *Group) invalidationGeneration(key string) int64 {
+	g.invalidateMu.Lock()
+	defer g.invalidateMu.Unlock()
+	return g.invalidations[key]
+}
+
+// populateIfFresh stores value in cache only when no Delete for key has
+// happened since loadGen was observed. When the load is still current,
+// its marker is consumed so the invalidations map does not retain keys
+// that have since been reloaded.
+func (g *Group) populateIfFresh(key string, value ByteView, cache *cache, loadGen int64) {
+	g.invalidateMu.Lock()
+	if g.invalidations[key] != loadGen {
+		g.invalidateMu.Unlock()
+		return
+	}
+	delete(g.invalidations, key)
+	g.invalidateMu.Unlock()
+
+	g.populateCache(key, value, cache)
 }
 
 // CacheType represents a type of cache.
@@ -425,7 +504,6 @@ func (c *cache) add(key string, value ByteView) {
 			OnEvicted: func(key lru.Key, value interface{}) {
 				val := value.(ByteView)
 				c.nbytes -= int64(len(key.(string))) + int64(val.Len())
-				c.nevict++
 			},
 		}
 	}
@@ -452,8 +530,30 @@ func (c *cache) removeOldest() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.lru != nil {
+		before := c.lru.Len()
 		c.lru.RemoveOldest()
+		if c.lru.Len() < before {
+			c.nevict++
+		}
 	}
+}
+
+// remove deletes key from the cache. Unlike removeOldest, an explicit
+// removal is an invalidation rather than a capacity-driven eviction, so
+// it does not increment nevict. It reports whether the key was present.
+func (c *cache) remove(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lru == nil {
+		return false
+	}
+	if _, ok := c.lru.Get(key); !ok {
+		return false
+	}
+	// lru.Get moved the element to the front, but Remove still drops it
+	// and the OnEvicted callback adjusts nbytes without touching nevict.
+	c.lru.Remove(key)
+	return true
 }
 
 func (c *cache) bytes() int64 {

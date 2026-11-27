@@ -23,6 +23,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strconv"
@@ -30,6 +31,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/golang/groupcache/consistenthash"
+	"github.com/golang/protobuf/proto"
+
+	pb "github.com/golang/groupcache/groupcachepb"
 )
 
 var (
@@ -109,6 +115,83 @@ func testKeys(n int) (keys []string) {
 		keys[i] = strconv.Itoa(i)
 	}
 	return
+}
+
+// TestHTTPPoolDelete verifies the HTTP DELETE wire path invalidates the
+// key on the serving peer and that the following GET reloads it.
+func TestHTTPPoolDelete(t *testing.T) {
+	// Build the pool struct directly: NewHTTPPoolOpts can only run once
+	// per process and TestHTTPPool already claims it.
+	p := &HTTPPool{
+		self:        "http://delete-test",
+		httpGetters: make(map[string]*httpGetter),
+		opts: HTTPPoolOptions{
+			BasePath: defaultBasePath,
+			Replicas: defaultReplicas,
+		},
+	}
+	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+
+	var fills AtomicInt
+	g := newGroup(uniqueGroupName(t), 1<<20, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		fills.Add(1)
+		return dest.SetString("ECHO:" + key)
+	}), p)
+
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+	p.self = srv.URL
+
+	getter := &httpGetter{baseURL: srv.URL + defaultBasePath}
+	req := &pb.GetRequest{
+		Group: proto.String(g.name),
+		Key:   proto.String("mykey"),
+	}
+
+	res := &pb.GetResponse{}
+	if err := getter.Get(context.TODO(), req, res); err != nil {
+		t.Fatal(err)
+	}
+	if string(res.GetValue()) != "ECHO:mykey" {
+		t.Fatalf("got %q", res.GetValue())
+	}
+	if fills.Get() != 1 {
+		t.Fatalf("fills = %d, want 1", fills.Get())
+	}
+
+	// A second GET is served from the cache.
+	if err := getter.Get(context.TODO(), req, &pb.GetResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	if fills.Get() != 1 {
+		t.Fatalf("fills = %d, want 1 (cached)", fills.Get())
+	}
+
+	if err := getter.Delete(context.TODO(), req, &pb.GetResponse{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := getter.Get(context.TODO(), req, &pb.GetResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	if fills.Get() != 2 {
+		t.Errorf("fills = %d after Delete, want 2", fills.Get())
+	}
+
+	// Unsupported methods are rejected explicitly.
+	httpReq, err := http.NewRequest("PATCH",
+		srv.URL+defaultBasePath+g.name+"/mykey", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultTransport.RoundTrip(httpReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("PATCH status = %v, want %v", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
 }
 
 func beChildForTestHTTPPool() {

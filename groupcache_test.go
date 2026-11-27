@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -171,6 +172,14 @@ func countFills(f func()) int64 {
 	return cacheFills.Get() - fills0
 }
 
+// uniqueGroupName returns a group name unique for the test process, so
+// tests run repeatedly with -count do not hit group registration panics.
+var uniqueGroupCounter int64
+
+func uniqueGroupName(t *testing.T) string {
+	return fmt.Sprintf("%s-%d", t.Name(), atomic.AddInt64(&uniqueGroupCounter, 1))
+}
+
 func TestCaching(t *testing.T) {
 	once.Do(testSetup)
 	fills := countFills(func() {
@@ -227,8 +236,9 @@ func TestCacheEviction(t *testing.T) {
 }
 
 type fakePeer struct {
-	hits int
-	fail bool
+	hits    int
+	deletes int
+	fail    bool
 }
 
 func (p *fakePeer) Get(_ context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
@@ -237,6 +247,14 @@ func (p *fakePeer) Get(_ context.Context, in *pb.GetRequest, out *pb.GetResponse
 		return errors.New("simulated error from peer")
 	}
 	out.Value = []byte("got:" + in.GetKey())
+	return nil
+}
+
+func (p *fakePeer) Delete(_ context.Context, in *pb.GetRequest, _ *pb.GetResponse) error {
+	p.deletes++
+	if p.fail {
+		return errors.New("simulated error from peer")
+	}
 	return nil
 }
 
@@ -450,6 +468,257 @@ func TestGroupStatsAlignment(t *testing.T) {
 	off := unsafe.Offsetof(g.Stats)
 	if off%8 != 0 {
 		t.Fatal("Stats structure is not 8-byte aligned.")
+	}
+}
+
+// TestDeleteNotCountedAsEviction verifies that an explicit Delete removes
+// the entry without being counted as a capacity eviction.
+func TestDeleteNotCountedAsEviction(t *testing.T) {
+	g := newGroup(uniqueGroupName(t), 1<<20, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		return dest.SetString("ECHO:" + key)
+	}), NoPeers{})
+
+	var s string
+	if err := g.Get(dummyCtx, "key", StringSink(&s)); err != nil {
+		t.Fatal(err)
+	}
+	if g.mainCache.items() != 1 {
+		t.Fatalf("mainCache has %d items, want 1", g.mainCache.items())
+	}
+
+	if err := g.Delete(dummyCtx, "key"); err != nil {
+		t.Fatal(err)
+	}
+	if items := g.mainCache.items(); items != 0 {
+		t.Errorf("mainCache has %d items after Delete, want 0", items)
+	}
+	if evicts := g.mainCache.nevict; evicts != 0 {
+		t.Errorf("Delete incremented nevict to %d, want 0", evicts)
+	}
+
+	// Capacity pressure still counts as evictions.
+	var flooded int64
+	for g.mainCache.nevict == 0 {
+		key := fmt.Sprintf("dummy-%d", flooded)
+		if err := g.Get(dummyCtx, key, StringSink(&s)); err != nil {
+			t.Fatal(err)
+		}
+		flooded++
+		if flooded > 100000 {
+			t.Fatal("never saw an eviction")
+		}
+	}
+}
+
+// TestDeleteForcesReload verifies that after Delete the next Get does not
+// serve the stale cached value but calls the getter again.
+func TestDeleteForcesReload(t *testing.T) {
+	var fills AtomicInt
+	g := newGroup(uniqueGroupName(t), 1<<20, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		fills.Add(1)
+		return dest.SetString("ECHO:" + key)
+	}), NoPeers{})
+
+	get := func() string {
+		var s string
+		if err := g.Get(dummyCtx, "key", StringSink(&s)); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if got := get(); got != "ECHO:key" {
+		t.Fatalf("got %q", got)
+	}
+	if get(); fills.Get() != 1 {
+		t.Fatalf("fills = %d, want 1", fills.Get())
+	}
+
+	if err := g.Delete(dummyCtx, "key"); err != nil {
+		t.Fatal(err)
+	}
+	if get(); fills.Get() != 2 {
+		t.Errorf("fills = %d after Delete, want 2", fills.Get())
+	}
+}
+
+// TestDeleteDropsHotAndMain verifies Delete clears both caches, including
+// a mirrored hotCache copy held by a non-owner.
+func TestDeleteDropsHotAndMain(t *testing.T) {
+	g := newGroup(uniqueGroupName(t), 1<<20, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		return dest.SetString("ECHO:" + key)
+	}), NoPeers{})
+
+	key := "TestDeleteDropsHotAndMain-key"
+	view := ByteView{s: "ECHO:" + key}
+	g.mainCache.add(key, view)
+	g.hotCache.add(key, view)
+
+	if err := g.Delete(dummyCtx, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.mainCache.get(key); ok {
+		t.Error("key still present in mainCache after Delete")
+	}
+	if _, ok := g.hotCache.get(key); ok {
+		t.Error("key still present in hotCache after Delete")
+	}
+	if g.mainCache.nevict != 0 || g.hotCache.nevict != 0 {
+		t.Errorf("nevict main=%d hot=%d, want 0/0", g.mainCache.nevict, g.hotCache.nevict)
+	}
+}
+
+// TestDeleteDuringInFlightLoad verifies that a load already running when
+// Delete is called cannot write its (stale) result back into the cache.
+func TestDeleteDuringInFlightLoad(t *testing.T) {
+	release := make(chan struct{})
+	var getterOnce sync.Once
+	var fills AtomicInt
+	g := newGroup(uniqueGroupName(t), 1<<20, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		fills.Add(1)
+		getterOnce.Do(func() { <-release })
+		return dest.SetString("ECHO:" + key)
+	}), NoPeers{})
+
+	key := "TestDeleteDuringInFlightLoad-key"
+	loadDone := make(chan struct{})
+	go func() {
+		var s string
+		if err := g.Get(dummyCtx, key, StringSink(&s)); err != nil {
+			t.Error(err)
+		}
+		close(loadDone)
+	}()
+
+	// Wait until the in-flight getter is blocked.
+	deadline := time.Now().Add(5 * time.Second)
+	for fills.Get() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if fills.Get() == 0 {
+		t.Fatal("getter never started")
+	}
+
+	if err := g.Delete(dummyCtx, key); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	<-loadDone
+
+	if _, ok := g.mainCache.get(key); ok {
+		t.Fatal("in-flight load wrote the deleted key back into mainCache")
+	}
+
+	// The next Get must reload rather than hit the stale value.
+	var s string
+	if err := g.Get(dummyCtx, key, StringSink(&s)); err != nil {
+		t.Fatal(err)
+	}
+	if fills.Get() != 2 {
+		t.Errorf("fills = %d, want 2 (in-flight load + reload)", fills.Get())
+	}
+}
+
+// TestDeleteForwardsToOwner verifies a non-owner forwards Delete to the
+// key's owner instead of only dropping its local mirror.
+func TestDeleteForwardsToOwner(t *testing.T) {
+	peer0 := &fakePeer{}
+	peer1 := &fakePeer{}
+	// A nil slot represents this node, mirroring TestPeers.
+	peerList := fakePeers([]ProtoGetter{peer0, peer1, nil})
+	g := newGroup(uniqueGroupName(t), 1<<20, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		return dest.SetString("ECHO:" + key)
+	}), peerList)
+
+	// Find a key whose owner is a remote peer rather than this node.
+	var key string
+	var owner *fakePeer
+	for i := 0; i < 100000; i++ {
+		key = fmt.Sprintf("delete-key-%d", i)
+		peer, ok := peerList.PickPeer(key)
+		if ok {
+			owner = peer.(*fakePeer)
+			break
+		}
+	}
+	if owner == nil {
+		t.Fatal("no remote-owned key found")
+	}
+
+	// Seed a local hotCache mirror that Delete must also clear.
+	view := ByteView{s: "stale:" + key}
+	g.hotCache.add(key, view)
+
+	if err := g.Delete(dummyCtx, key); err != nil {
+		t.Fatal(err)
+	}
+	if owner.deletes != 1 {
+		t.Errorf("owner received %d Delete calls, want 1", owner.deletes)
+	}
+	if _, ok := g.hotCache.get(key); ok {
+		t.Error("local hotCache mirror survived Delete")
+	}
+
+	// A failing owner must surface the error and leave the local copy alone
+	// so the failure is visible rather than silently half-deleting.
+	owner.fail = true
+	g.hotCache.add(key, view)
+	if err := g.Delete(dummyCtx, key); err == nil {
+		t.Error("Delete to failing owner returned nil, want error")
+	}
+	if _, ok := g.hotCache.get(key); !ok {
+		t.Error("local copy was dropped despite failed forward")
+	}
+}
+
+// TestDeleteOnOwnerNoForward verifies Delete stays local when this node
+// owns the key, and that a reloaded key consumes its invalidation marker.
+func TestDeleteOnOwnerNoForward(t *testing.T) {
+	peer0 := &fakePeer{}
+	peer1 := &fakePeer{}
+	peerList := fakePeers([]ProtoGetter{peer0, peer1, nil})
+	g := newGroup(uniqueGroupName(t), 1<<20, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+		return dest.SetString("ECHO:" + key)
+	}), peerList)
+
+	var key string
+	found := false
+	for i := 0; i < 100000; i++ {
+		key = fmt.Sprintf("owner-key-%d", i)
+		if _, ok := peerList.PickPeer(key); !ok {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no owner-local key found")
+	}
+
+	var s string
+	if err := g.Get(dummyCtx, key, StringSink(&s)); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Delete(dummyCtx, key); err != nil {
+		t.Fatal(err)
+	}
+	if peer0.deletes+peer1.deletes != 0 {
+		t.Errorf("Delete forwarded to peer for owner-local key: %d/%d", peer0.deletes, peer1.deletes)
+	}
+
+	// Reloading must consume the marker, and a later Delete still works.
+	if err := g.Get(dummyCtx, key, StringSink(&s)); err != nil {
+		t.Fatal(err)
+	}
+	g.invalidateMu.Lock()
+	_, marked := g.invalidations[key]
+	g.invalidateMu.Unlock()
+	if marked {
+		t.Error("invalidation marker survived the reload")
+	}
+	if err := g.Delete(dummyCtx, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.mainCache.get(key); ok {
+		t.Error("second Delete did not clear mainCache")
 	}
 }
 

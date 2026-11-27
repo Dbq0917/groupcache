@@ -166,21 +166,32 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	group.Stats.ServerRequests.Add(1)
-	var value []byte
-	err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	switch r.Method {
+	case http.MethodGet:
+		var value []byte
+		err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	// Write the value to the response body as a proto message.
-	body, err := proto.Marshal(&pb.GetResponse{Value: value})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Write the value to the response body as a proto message.
+		body, err := proto.Marshal(&pb.GetResponse{Value: value})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Write(body)
+	case http.MethodDelete:
+		if err := group.Delete(ctx, key); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-protobuf")
-	w.Write(body)
 }
 
 type httpGetter struct {
@@ -199,14 +210,33 @@ func (h *httpGetter) Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResp
 		url.QueryEscape(in.GetGroup()),
 		url.QueryEscape(in.GetKey()),
 	)
-	req, err := http.NewRequest("GET", u, nil)
+	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
 	req = req.WithContext(ctx)
+	return h.doRequest(req, out)
+}
+
+func (h *httpGetter) Delete(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
+	u := fmt.Sprintf(
+		"%v%v/%v",
+		h.baseURL,
+		url.QueryEscape(in.GetGroup()),
+		url.QueryEscape(in.GetKey()),
+	)
+	req, err := http.NewRequest(http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	req = req.WithContext(ctx)
+	return h.doRequest(req, out)
+}
+
+func (h *httpGetter) doRequest(req *http.Request, out *pb.GetResponse) error {
 	tr := http.DefaultTransport
 	if h.transport != nil {
-		tr = h.transport(ctx)
+		tr = h.transport(req.Context())
 	}
 	res, err := tr.RoundTrip(req)
 	if err != nil {

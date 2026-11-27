@@ -30,6 +30,8 @@ type Context = context.Context
 // ProtoGetter is the interface that must be implemented by a peer.
 type ProtoGetter interface {
 	Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error
+	// Delete invalidates the key identified by in on the peer.
+	Delete(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error
 }
 
 // PeerPicker is the interface that must be implemented to locate
